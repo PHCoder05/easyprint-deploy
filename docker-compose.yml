@@ -1,0 +1,169 @@
+# Image-only EasyPrint. Use the Makefile next to this file.
+#
+#   docker login ghcr.io
+#   make up
+#   make status
+#   make down      stop, keep data
+#   make purge     delete containers, volumes, and images
+name: easyprint
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    configs:
+      - source: keycloak_db_init
+        target: /docker-entrypoint-initdb.d/10-keycloak-db.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_PORT}:9000"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  keycloak:
+    image: ${EASYPRINT_IMAGE_PREFIX}/easyprint-keycloak:${EASYPRINT_IMAGE_TAG}
+    command: start --import-realm
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+      KC_HTTP_PORT: 8180
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HOSTNAME: http://${PUBLIC_HOST}:8180
+      KC_HOSTNAME_STRICT: "false"
+      KC_HEALTH_ENABLED: "true"
+      KC_CACHE: local
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${KEYCLOAK_DB_NAME}
+      KC_DB_USERNAME: ${POSTGRES_USER}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${KEYCLOAK_PORT}:8180"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  migrate:
+    image: ${EASYPRINT_IMAGE_PREFIX}/easyprint-api:${EASYPRINT_IMAGE_TAG}
+    entrypoint: ["/usr/local/bin/easyprint-migrate"]
+    command: ["up"]
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      MIGRATIONS_DIR: /migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    image: ${EASYPRINT_IMAGE_PREFIX}/easyprint-api:${EASYPRINT_IMAGE_TAG}
+    environment:
+      APP_ENV: ${APP_ENV}
+      API_ADDR: :8080
+      LOG_LEVEL: ${LOG_LEVEL}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET}
+      PII_SECRET: ${PII_SECRET}
+      STORAGE_BACKEND: minio
+      MINIO_ENDPOINT: minio:9000
+      MINIO_PUBLIC_ENDPOINT: http://${PUBLIC_HOST}:${MINIO_PORT}
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      MINIO_USE_SSL: "false"
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET}
+      PUBLIC_ORG_ID: ${PUBLIC_ORG_ID}
+      OTP_SMS_WEBHOOK_URL: ${OTP_SMS_WEBHOOK_URL}
+      WS_ALLOWED_ORIGINS: http://${PUBLIC_HOST}:${ADMIN_PORT},http://${PUBLIC_HOST}:${MOBILE_PORT}
+      OIDC_ISSUER: http://${PUBLIC_HOST}:${KEYCLOAK_PORT}/realms/easyprint
+      OIDC_JWKS_URL: http://keycloak:8180/realms/easyprint/protocol/openid-connect/certs
+      OIDC_AUDIENCE: easyprint-admin
+      KEYCLOAK_ADMIN_BASE_URL: http://keycloak:8180
+      KEYCLOAK_REALM: easyprint
+      KEYCLOAK_ADMIN_USER: ${KEYCLOAK_ADMIN_USER}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+    ports:
+      - "${API_PORT}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    restart: unless-stopped
+
+  admin:
+    image: ${EASYPRINT_IMAGE_PREFIX}/easyprint-admin:${EASYPRINT_IMAGE_TAG}
+    environment: &web_env
+      VITE_OIDC_AUTHORITY: http://${PUBLIC_HOST}:${KEYCLOAK_PORT}/realms/easyprint
+      VITE_OIDC_CLIENT_ID: easyprint-admin
+      VITE_OIDC_REDIRECT_URI: http://${PUBLIC_HOST}:${ADMIN_PORT}/auth/callback
+      VITE_KEYCLOAK_ADMIN_URL: http://${PUBLIC_HOST}:${KEYCLOAK_PORT}/admin/master/console/#/easyprint
+      VITE_PLATFORM_URL: http://${PUBLIC_HOST}:${API_PORT}/v1
+      VITE_MOBILE_WEB_URL: http://${PUBLIC_HOST}:${MOBILE_PORT}
+    ports:
+      - "${ADMIN_PORT}:8080"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  mobile:
+    image: ${EASYPRINT_IMAGE_PREFIX}/easyprint-mobile:${EASYPRINT_IMAGE_TAG}
+    environment:
+      <<: *web_env
+    ports:
+      - "${MOBILE_PORT}:8080"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+configs:
+  keycloak_db_init:
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname "$$POSTGRES_DB" <<EOSQL
+      SELECT 'CREATE DATABASE keycloak'
+      WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'keycloak')\gexec
+      EOSQL
+
+volumes:
+  postgres_data:
+  minio_data:

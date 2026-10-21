@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# Image-only EasyPrint. Run from this directory: make up | make status | ./easyprint <cmd>
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="${DEPLOY_ENV_FILE:-${ROOT}/.env}"
+EXAMPLE="${ROOT}/env.example"
+COMPOSE_FILE="${ROOT}/docker-compose.yml"
+
+die() {
+  echo "$*" >&2
+  exit 1
+}
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die "Docker is required. Install Docker, then run make up."
+  docker compose version >/dev/null 2>&1 || die "The Docker Compose plugin is required."
+}
+
+ensure_env() {
+  if [[ -f "$ENV_FILE" ]]; then
+    return 0
+  fi
+  [[ -f "$EXAMPLE" ]] || die "Missing ${EXAMPLE}"
+  cp "$EXAMPLE" "$ENV_FILE"
+  echo "Created ${ENV_FILE} from env.example."
+  echo "Edit PUBLIC_HOST and the secrets in that file if this machine is not ${ROOT}."
+}
+
+load_env() {
+  [[ -f "$ENV_FILE" ]] || die "Missing ${ENV_FILE}. Run: make env"
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+  [[ -n "${PUBLIC_HOST:-}" ]] || die "Set PUBLIC_HOST in ${ENV_FILE}"
+  [[ -n "${EASYPRINT_IMAGE_PREFIX:-}" ]] || die "Set EASYPRINT_IMAGE_PREFIX in ${ENV_FILE}"
+  [[ -n "${EASYPRINT_IMAGE_TAG:-}" ]] || die "Set EASYPRINT_IMAGE_TAG in ${ENV_FILE}"
+}
+
+compose() {
+  docker compose --project-directory "$ROOT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+wait_api() {
+  local url="http://127.0.0.1:${API_PORT}/v1/healthz"
+  local i
+  for i in $(seq 1 60); do
+    if curl -sf --max-time 3 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "API did not become ready. Check: make logs SVC=api" >&2
+  return 1
+}
+
+cmd_help() {
+  cat <<'EOF'
+EasyPrint images — run in this directory.
+
+  make env       Copy env.example to .env when .env is missing
+  make pull      Download images from GHCR
+  make up        Create .env if needed, pull, and start
+  make down      Stop containers. Data volumes stay
+  make restart   Restart containers
+  make status    Health and URLs
+  make logs      Follow logs (one service: make logs SVC=api)
+  make ps        Container list
+  make clean     Stop and delete volumes (database and files)
+  make purge     clean, and delete the pulled images
+
+  ./easyprint <cmd>   same commands
+
+First time
+  docker login ghcr.io
+  make up
+  make status
+
+Remove the install
+  make purge
+EOF
+}
+
+cmd_env() {
+  if [[ -f "$ENV_FILE" ]]; then
+    echo ".env already exists: ${ENV_FILE}"
+    return 0
+  fi
+  ensure_env
+}
+
+cmd_pull() {
+  need_docker
+  load_env
+  if ! compose pull; then
+    die "Image pull failed. Private packages need: docker login ghcr.io"
+  fi
+}
+
+cmd_up() {
+  need_docker
+  ensure_env
+  load_env
+  echo "==> Pull ${EASYPRINT_IMAGE_PREFIX}/*:${EASYPRINT_IMAGE_TAG}"
+  if ! compose pull; then
+    die "Image pull failed. Private packages need: docker login ghcr.io"
+  fi
+  echo "==> Start"
+  compose up -d
+  echo "==> Wait for API"
+  wait_api
+  cmd_status
+}
+
+cmd_down() {
+  need_docker
+  load_env
+  compose down
+  echo "Stopped. Volumes kept. Delete data with: make clean"
+}
+
+cmd_restart() {
+  need_docker
+  load_env
+  compose restart
+  wait_api
+  cmd_status
+}
+
+cmd_logs() {
+  need_docker
+  load_env
+  compose logs -f --tail 100 "$@"
+}
+
+cmd_ps() {
+  need_docker
+  load_env
+  compose ps
+}
+
+cmd_clean() {
+  need_docker
+  load_env
+  compose down -v
+  echo "Containers and volumes removed. .env is still ${ENV_FILE}"
+}
+
+cmd_purge() {
+  need_docker
+  load_env
+  compose down -v --rmi all
+  echo "Containers, volumes, and images removed. .env is still ${ENV_FILE}"
+}
+
+cmd_status() {
+  need_docker
+  load_env
+  local api="http://${PUBLIC_HOST}:${API_PORT}"
+  local health="http://127.0.0.1:${API_PORT}/v1/healthz"
+
+  printf '\n── EasyPrint ──\n\n'
+  if curl -sf --max-time 3 "$health" >/dev/null 2>&1; then
+    echo "API:      up    ${api}"
+  else
+    echo "API:      down  ${api}"
+  fi
+  if curl -sf --max-time 3 -o /dev/null "http://127.0.0.1:${ADMIN_PORT}/"; then
+    echo "Admin:    up    http://${PUBLIC_HOST}:${ADMIN_PORT}"
+  else
+    echo "Admin:    down  http://${PUBLIC_HOST}:${ADMIN_PORT}"
+  fi
+  if curl -sf --max-time 3 -o /dev/null "http://127.0.0.1:${MOBILE_PORT}/"; then
+    echo "Guest:    up    http://${PUBLIC_HOST}:${MOBILE_PORT}"
+  else
+    echo "Guest:    down  http://${PUBLIC_HOST}:${MOBILE_PORT}"
+  fi
+  echo "Auth:     http://${PUBLIC_HOST}:${KEYCLOAK_PORT}"
+  echo "Storage:  http://${PUBLIC_HOST}:${MINIO_PORT}"
+  echo "Images:   ${EASYPRINT_IMAGE_PREFIX}/*:${EASYPRINT_IMAGE_TAG}"
+  echo ""
+  compose ps
+  echo ""
+}
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  help|-h|--help) cmd_help ;;
+  env|init) cmd_env ;;
+  pull) cmd_pull ;;
+  up|start) cmd_up ;;
+  down|stop) cmd_down ;;
+  restart) cmd_restart ;;
+  status) cmd_status ;;
+  logs) cmd_logs "$@" ;;
+  ps) cmd_ps ;;
+  clean) cmd_clean ;;
+  purge) cmd_purge ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    cmd_help
+    exit 1
+    ;;
+esac
